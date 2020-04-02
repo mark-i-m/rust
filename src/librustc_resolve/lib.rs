@@ -33,7 +33,7 @@ use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
 use rustc_data_structures::ptr_key::PtrKey;
 use rustc_data_structures::sync::Lrc;
 use rustc_errors::{struct_span_err, Applicability, DiagnosticBuilder};
-use rustc_expand::base::SyntaxExtension;
+use rustc_expand::{base::SyntaxExtension, mbe::macro_rules::MbeMetavarInfo};
 use rustc_hir::def::Namespace::*;
 use rustc_hir::def::{self, CtorOf, DefKind, NonMacroAttrKind, PartialRes};
 use rustc_hir::def_id::{CrateNum, DefId, DefIdMap, CRATE_DEF_INDEX};
@@ -962,6 +962,10 @@ pub struct Resolver<'a> {
     lint_buffer: LintBuffer,
 
     next_node_id: NodeId,
+
+    /// Keep track of macro matchers and how their metavars are used. This allows us to build good
+    /// documentation for them later.
+    mbe_metavar_info: FxHashMap<NodeId, MbeMetavarInfo>,
 }
 
 /// Nothing really interesting here; it just provides memory for the rest of the crate.
@@ -1246,6 +1250,8 @@ impl<'a> Resolver<'a> {
             variant_vis: Default::default(),
             lint_buffer: LintBuffer::default(),
             next_node_id: NodeId::from_u32(1),
+
+            mbe_metavar_info: Default::default(),
         }
     }
 

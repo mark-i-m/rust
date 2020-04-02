@@ -1055,12 +1055,14 @@ impl<'a> Resolver<'a> {
     /// Compile the macro into a `SyntaxExtension` and possibly replace
     /// its expander to a pre-defined one for built-in macros.
     crate fn compile_macro(&mut self, item: &ast::Item, edition: Edition) -> SyntaxExtension {
-        let mut result = compile_declarative_macro(
+        let (mut result, metavar_info) = compile_declarative_macro(
             &self.session.parse_sess,
             self.session.features_untracked(),
             item,
             edition,
         );
+
+        self.mbe_metavar_info.insert(item.id, metavar_info);
 
         if result.is_builtin {
             // The macro was marked with `#[rustc_builtin_macro]`.

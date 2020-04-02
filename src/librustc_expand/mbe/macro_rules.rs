@@ -8,9 +8,9 @@ use crate::mbe::macro_parser::{Error, ErrorReported, Failure, Success};
 use crate::mbe::macro_parser::{MatchedNonterminal, MatchedSeq};
 use crate::mbe::transcribe::transcribe;
 
-use rustc_ast::ast;
 use rustc_ast::token::{self, NtTT, Token, TokenKind::*};
 use rustc_ast::tokenstream::{DelimSpan, TokenStream};
+use rustc_ast::{ast, node_id::NodeId};
 use rustc_ast_pretty::pprust;
 use rustc_attr::{self as attr, TransparencyError};
 use rustc_data_structures::fx::FxHashMap;
@@ -21,7 +21,7 @@ use rustc_parse::parser::Parser;
 use rustc_session::parse::ParseSess;
 use rustc_span::edition::Edition;
 use rustc_span::hygiene::Transparency;
-use rustc_span::symbol::{kw, sym, MacroRulesNormalizedIdent, Symbol};
+use rustc_span::symbol::{kw, sym, Ident, MacroRulesNormalizedIdent, Symbol};
 use rustc_span::Span;
 
 use log::debug;
@@ -32,6 +32,35 @@ use std::{mem, slice};
 const VALID_FRAGMENT_NAMES_MSG: &str = "valid fragment specifiers are \
                                         `ident`, `block`, `stmt`, `expr`, `pat`, `ty`, `lifetime`, \
                                         `literal`, `path`, `meta`, `tt`, `item` and `vis`";
+
+/// The usage of a single metavariable in one macro arm.
+#[derive(Debug, Clone)]
+pub enum MbeMetavarUsage {
+    /// The metavariable is not used at all in the body. i.e. its tokens are discarded entirely.
+    None,
+
+    /// The metavariable is used a macro call to the given macro, i.e. `other_macro!($mytt)`. The
+    /// `DefId` is for the other macro.
+    Macro(NodeId),
+
+    /// The metavariable is used directly in the body of the given macro. This means it must be
+    /// appropriate to use at the call site of the macro (e.g. it must be valid rust syntax or it
+    /// must be appropriate input for another macro). We can't know at compile time easily.
+    Direct,
+}
+
+/// Information about how a particular MBE macro's metavariables are used and matched. This is used
+/// to build documentation later.
+#[derive(Debug, Default, Clone)]
+pub struct MbeMetavarInfo {
+    /// A list of token trees, one for each macro arm. Each token tree represents the matchers of
+    /// its respective arm.
+    lhs: Vec<mbe::TokenTree>,
+
+    /// The metavariables used in each arm's corresponding body. In particular, we really only keep
+    /// track of :tt matchers, since they are the only wildcards.
+    rhs: Vec<FxHashMap<Ident, Vec<MbeMetavarUsage>>>,
+}
 
 crate struct ParserAnyMacro<'a> {
     parser: Parser<'a>,
@@ -387,7 +416,7 @@ pub fn compile_declarative_macro(
     features: &Features,
     def: &ast::Item,
     edition: Edition,
-) -> SyntaxExtension {
+) -> (SyntaxExtension, MbeMetavarInfo) {
     let mk_syn_ext = |expander| {
         SyntaxExtension::new(
             sess,
@@ -455,14 +484,14 @@ pub fn compile_declarative_macro(
             let s = parse_failure_msg(&token);
             let sp = token.span.substitute_dummy(def.span);
             sess.span_diagnostic.struct_span_err(sp, &s).span_label(sp, msg).emit();
-            return mk_syn_ext(Box::new(macro_rules_dummy_expander));
+            return (mk_syn_ext(Box::new(macro_rules_dummy_expander)), Default::default());
         }
         Error(sp, msg) => {
             sess.span_diagnostic.struct_span_err(sp.substitute_dummy(def.span), &msg).emit();
-            return mk_syn_ext(Box::new(macro_rules_dummy_expander));
+            return (mk_syn_ext(Box::new(macro_rules_dummy_expander)), Default::default());
         }
         ErrorReported => {
-            return mk_syn_ext(Box::new(macro_rules_dummy_expander));
+            return (mk_syn_ext(Box::new(macro_rules_dummy_expander)), Default::default());
         }
     };
 
@@ -525,14 +554,18 @@ pub fn compile_declarative_macro(
         None => {}
     }
 
-    mk_syn_ext(Box::new(MacroRulesMacroExpander {
+    let metavar_info = extract_metavar_info(sess, &lhses, &rhses);
+
+    let syn_ext = mk_syn_ext(Box::new(MacroRulesMacroExpander {
         name: def.ident,
         span: def.span,
         transparency,
         lhses,
         rhses,
         valid,
-    }))
+    }));
+
+    (syn_ext, metavar_info)
 }
 
 fn check_lhs_nt_follows(
@@ -610,6 +643,62 @@ fn check_matcher(
     let err = sess.span_diagnostic.err_count();
     check_matcher_core(sess, features, attrs, &first_sets, matcher, &empty_suffix);
     err == sess.span_diagnostic.err_count()
+}
+
+fn extract_metavar_info(
+    _sess: &ParseSess,
+    lhses: &[mbe::TokenTree],
+    rhses: &[mbe::TokenTree],
+) -> MbeMetavarInfo {
+    let mut metavar_info = MbeMetavarInfo::default();
+
+    // We need to go through the LHS and find all :tt matchers.  For each of those matchers, we
+    // find the usage of the corresponding metavariable.
+    for (lhs, rhs) in lhses.iter().zip(rhses) {
+        metavar_info.lhs.push(lhs.clone());
+        metavar_info.rhs.push(
+            find_all_metavars(lhs)
+                .into_iter()
+                .map(|metavar| (metavar, find_metavar_usage_in_rhs(metavar, rhs)))
+                .collect(),
+        );
+    }
+
+    metavar_info
+}
+
+/// Collects all metavar declarations in the tokentree.
+fn find_all_metavars(tt: &mbe::TokenTree) -> Vec<Ident> {
+    fn recurse(tt: &mbe::TokenTree, metavars: &mut Vec<Ident>) {
+        use mbe::TokenTree::*;
+
+        match tt {
+            Delimited(_, delim) => delim.tts.iter().for_each(|tt| recurse(tt, metavars)),
+            Sequence(_, seq) => seq.tts.iter().for_each(|tt| recurse(tt, metavars)),
+            MetaVarDecl(_, name, _) => metavars.push(*name),
+            _ => {}
+        };
+    }
+
+    let mut found = Vec::new();
+    recurse(tt, &mut found);
+    found
+}
+
+/// Find all usages of the metavariable in the RHS.
+fn find_metavar_usage_in_rhs(metavar: Ident, rhs: &mbe::TokenTree) -> Vec<MbeMetavarUsage> {
+    // Search for `MetaVar` tts in the rhs. As we decend the tree, we should also keep track of the
+    // context, i.e. are we inside a macro invocation.
+    let mut occurences = Vec::new();
+
+    // TODO(mark-i-m) Recursively descend into the tree.
+
+    // if we return to the top and we haven't found anything, return None.
+    if occurences.is_empty() {
+        occurences.push(MbeMetavarUsage::None);
+    }
+
+    return occurences;
 }
 
 // `The FirstSets` for a matcher is a mapping from subsequences in the
